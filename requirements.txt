@@ -1,0 +1,5 @@
+# Core dependencies for vid-sense project
+numpy<2.0.0  # OpenCV compatibility - must be < 2.0
+opencv-python>=4.5.0
+ollama>=0.1.0
+
