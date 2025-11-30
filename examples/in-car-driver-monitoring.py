@@ -128,6 +128,9 @@ class DriverBehaviorAnalyzer:
         )
         
         response = self.query_llm(query, frames)
+        if response is None:
+            response = "Error: Could not analyze driver attention. LLM service unavailable."
+            logger.error("Failed to analyze driver attention: LLM query returned None")
         
         return {
             'timestamp': datetime.datetime.now().isoformat(),
@@ -155,6 +158,9 @@ class DriverBehaviorAnalyzer:
         )
         
         response = self.query_llm(query, frames)
+        if response is None:
+            response = "Error: Could not analyze hand position. LLM service unavailable."
+            logger.error("Failed to analyze hand position: LLM query returned None")
         
         return {
             'timestamp': datetime.datetime.now().isoformat(),
@@ -182,6 +188,9 @@ class DriverBehaviorAnalyzer:
         )
         
         response = self.query_llm(query, frames)
+        if response is None:
+            response = "Error: Could not detect face state. LLM service unavailable."
+            logger.error("Failed to detect face state: LLM query returned None")
         
         # Parse face state from response
         face_state = self._parse_face_state(response)
@@ -236,13 +245,16 @@ class DriverBehaviorAnalyzer:
         )
         
         response = self.query_llm(query, frames)
+        if response is None:
+            response = "Error: Could not detect impaired driving. LLM service unavailable."
+            logger.error("Failed to detect impaired driving: LLM query returned None")
         
         # Parse alert level from response
         alert_level = self._parse_alert_level(response)
         
         # Override alert level based on face state if needed
         if face_state:
-            alert_level = self._adjust_alert_level_by_face_state(alert_level, face_state, response)
+            alert_level = self._adjust_alert_level_by_face_state(alert_level, face_state, response or "")
         
         result = {
             'timestamp': datetime.datetime.now().isoformat(),
@@ -281,6 +293,9 @@ class DriverBehaviorAnalyzer:
         )
         
         response = self.query_llm(query, frames)
+        if response is None:
+            response = "Error: Could not analyze scene. LLM service unavailable."
+            logger.error("Failed to analyze general scene: LLM query returned None")
         
         return {
             'timestamp': datetime.datetime.now().isoformat(),
@@ -289,16 +304,20 @@ class DriverBehaviorAnalyzer:
             'frames_analyzed': len(frames)
         }
     
-    def _parse_face_state(self, response: str) -> str:
+    def _parse_face_state(self, response: Optional[str]) -> str:
         """
         Parse face state from LLM response.
         
         Args:
-            response: LLM response text
+            response: LLM response text (may be None if query failed)
         
         Returns:
             Detected face state
         """
+        if response is None:
+            logger.warning("Cannot parse face state: LLM response is None")
+            return 'UNKNOWN'
+        
         response_upper = response.upper()
         
         # Check for specific states in order of priority
@@ -319,17 +338,21 @@ class DriverBehaviorAnalyzer:
         else:
             return 'UNKNOWN'
     
-    def _parse_alert_level(self, response: str) -> str:
+    def _parse_alert_level(self, response: Optional[str]) -> str:
         """
         Parse alert level from LLM response.
         Prioritizes explicit level statements and looks for safety-related keywords.
         
         Args:
-            response: LLM response text
+            response: LLM response text (may be None if query failed)
         
         Returns:
             Alert level: 'LOW', 'MODERATE', or 'HIGH'
         """
+        if response is None:
+            logger.warning("Cannot parse alert level: LLM response is None")
+            return 'LOW'  # Default to LOW to avoid false positives
+        
         response_upper = response.upper()
         
         # Check if response starts with explicit level (most reliable)
@@ -370,7 +393,7 @@ class DriverBehaviorAnalyzer:
         # Default to LOW to avoid false positives
         return 'LOW'
     
-    def _adjust_alert_level_by_face_state(self, current_level: str, face_state: str, response: str) -> str:
+    def _adjust_alert_level_by_face_state(self, current_level: str, face_state: str, response: Optional[str]) -> str:
         """
         Adjust alert level based on detected face state.
         Sub-optimal states (tired, exhausted, sleepy, angry) should trigger alerts.
@@ -378,7 +401,7 @@ class DriverBehaviorAnalyzer:
         Args:
             current_level: Current alert level from LLM response
             face_state: Detected face state
-            response: LLM response text
+            response: LLM response text (may be None)
         
         Returns:
             Adjusted alert level
@@ -415,16 +438,19 @@ class DriverBehaviorAnalyzer:
         # For unknown states, trust the LLM but be cautious
         return current_level
     
-    def _is_safety_concern(self, response: str) -> bool:
+    def _is_safety_concern(self, response: Optional[str]) -> bool:
         """
         Check if the response indicates an actual safety concern (not just a face state).
         
         Args:
-            response: LLM response text
+            response: LLM response text (may be None)
         
         Returns:
             True if response indicates a safety concern
         """
+        if response is None:
+            return False  # No response means no safety concern detected
+        
         response_upper = response.upper()
         
         # Safety concern keywords
