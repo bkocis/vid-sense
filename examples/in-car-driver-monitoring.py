@@ -24,6 +24,10 @@ import logging
 from typing import List, Optional, Dict, Tuple
 from collections import deque
 import time
+import os
+import argparse
+from pathlib import Path
+from ground_truth_evaluator import GroundTruthEvaluator
 
 # Configure logging
 logging.basicConfig(
@@ -40,6 +44,11 @@ class DriverMonitoringConfig:
     PROCESSING_INTERVAL_SECONDS = 2  # Process every 2 seconds
     FRAME_BUFFER_SIZE = 5  # Keep last 5 frames for temporal analysis
     ALERT_THRESHOLD = 0.7  # Confidence threshold for alerts
+    
+    # Frame resizing for performance optimization
+    # Set to None for no resizing, or (width, height) tuple for fixed size
+    # Examples: None (no resize), (640, 480), (512, 512), (800, 600)
+    FRAME_RESIZE_TO = (640, 480)  # Resize to 640x480 for faster processing
     
     # LLM generation parameters
     TEMPERATURE = 0
@@ -64,6 +73,7 @@ class DriverBehaviorAnalyzer:
         self.frame_buffer = deque(maxlen=config.FRAME_BUFFER_SIZE)
         self.alert_history = []
         self.last_analysis_time = 0
+        self.recent_alert_levels = deque(maxlen=3)  # Track recent alert levels for temporal smoothing
         
     def query_llm(self, query: str, image_list: List[bytes]) -> Optional[str]:
         """
@@ -203,7 +213,7 @@ class DriverBehaviorAnalyzer:
             'frames_analyzed': len(frames)
         }
     
-    def detect_impaired_driving(self, frames: List[bytes], face_state: Optional[str] = None, frame_id: Optional[int] = None) -> Dict[str, any]:
+    def detect_impaired_driving(self, frames: List[bytes], face_state: Optional[str] = None, frame_id: Optional[int] = None, timestamp_seconds: Optional[float] = None) -> Dict[str, any]:
         """
         Detect signs of impaired driving behavior.
         Uses face state information to inform alert levels.
@@ -218,10 +228,14 @@ class DriverBehaviorAnalyzer:
         """
         # Build query with face state context if available
         query_base = (
-            "Analyze these sequential video frames for signs of impaired driving that pose a safety risk. "
-            "Look for: 1) Eyes closed or heavily drooping 2) Head nodding or falling forward "
-            "3) Erratic head movements 4) Slowed reactions or unresponsiveness "
-            "5) Signs of drowsiness, exhaustion, fatigue, or emotional distress affecting driving ability. "
+            "Analyze these sequential video frames for signs of impaired driving that pose a CRITICAL safety risk. "
+            "Be VERY CONSERVATIVE - only report impairment if there are CLEAR, OBVIOUS signs of danger. "
+            "Look for: 1) Eyes CLOSED (not just drooping) for more than a brief moment "
+            "2) Head FALLING FORWARD or NODDING OFF (not just tilting) "
+            "3) COMPLETE unresponsiveness or loss of consciousness "
+            "4) SEVERE drowsiness with eyes struggling to stay open "
+            "Do NOT report impairment for: normal blinking, slight tiredness, normal head movements, "
+            "or momentary distractions. Only report MODERATE or HIGH if there is a GENUINE safety risk. "
         )
         
         if face_state:
@@ -238,9 +252,11 @@ class DriverBehaviorAnalyzer:
                 )
         
         query = query_base + (
-            "Rate the concern level as: LOW (normal/alert driver with no safety concerns), "
-            "MODERATE (mild drowsiness, tiredness, exhaustion, or distraction that could affect driving), "
-            "or HIGH (severe drowsiness, eyes closed, exhaustion, or dangerous behavior). "
+            "Rate the concern level as: "
+            "LOW (normal/alert driver, eyes open, attentive, no safety concerns - DEFAULT if uncertain), "
+            "MODERATE (ONLY if there are CLEAR signs like eyes frequently closing, head nodding, clear drowsiness), "
+            "or HIGH (ONLY if eyes are CLOSED, head falling forward, or complete loss of alertness). "
+            "When in doubt, choose LOW. Only use MODERATE or HIGH for OBVIOUS safety risks. "
             "Start your response with the concern level in ALL CAPS: LOW, MODERATE, or HIGH."
         )
         
@@ -256,11 +272,17 @@ class DriverBehaviorAnalyzer:
         if face_state:
             alert_level = self._adjust_alert_level_by_face_state(alert_level, face_state, response or "")
         
+        # Apply temporal smoothing - require consistency before alerting
+        # Only downgrade if we have recent LOW detections, don't upgrade
+        # Pass face_state to preserve HIGH alerts from SLEEPY face state
+        smoothed_alert_level = self._apply_temporal_smoothing(alert_level, face_state=face_state)
+        
         result = {
             'timestamp': datetime.datetime.now().isoformat(),
             'analysis_type': 'impaired_driving',
             'response': response,
-            'alert_level': alert_level,
+            'alert_level': smoothed_alert_level,
+            'raw_alert_level': alert_level,  # Keep original for debugging
             'face_state_considered': face_state,
             'frames_analyzed': len(frames)
         }
@@ -269,11 +291,56 @@ class DriverBehaviorAnalyzer:
         if frame_id is not None:
             result['frame_id'] = frame_id
         
-        # Trigger alert for any concerning state
-        if alert_level in ['MODERATE', 'HIGH']:
+        # Include video timestamp if provided
+        if timestamp_seconds is not None:
+            result['timestamp_seconds'] = timestamp_seconds
+        
+        # Trigger alert for any concerning state (after smoothing)
+        if smoothed_alert_level in ['MODERATE', 'HIGH']:
             self._trigger_alert(result)
         
         return result
+    
+    def _apply_temporal_smoothing(self, alert_level: str, face_state: Optional[str] = None) -> str:
+        """
+        Apply temporal smoothing to reduce false positives.
+        Requires consistent detections before alerting.
+        SLEEPY face state always results in HIGH alert level and is not downgraded.
+        
+        Args:
+            alert_level: Current alert level
+            face_state: Detected face state (optional)
+        
+        Returns:
+            Smoothed alert level
+        """
+        # SLEEPY face state always results in HIGH alert level - never downgrade
+        if face_state == 'SLEEPY' and alert_level == 'HIGH':
+            self.recent_alert_levels.append(alert_level)
+            return 'HIGH'
+        
+        # Add current level to history
+        self.recent_alert_levels.append(alert_level)
+        
+        # If we have at least 2 recent detections
+        if len(self.recent_alert_levels) >= 2:
+            recent = list(self.recent_alert_levels)
+            # If recent detections are inconsistent, be conservative
+            if alert_level in ['MODERATE', 'HIGH']:
+                # Check if previous detection was LOW
+                if len(recent) >= 2 and recent[-2] == 'LOW':
+                    # Single spike, downgrade to LOW
+                    logger.debug(f"Temporal smoothing: downgrading {alert_level} to LOW (inconsistent with previous LOW)")
+                    return 'LOW'
+                # If we have 2+ consecutive MODERATE/HIGH, keep it
+                if len(recent) >= 2 and all(level in ['MODERATE', 'HIGH'] for level in recent[-2:]):
+                    return alert_level
+                # If only one MODERATE/HIGH, downgrade to LOW
+                if alert_level == 'MODERATE' and recent[-2] == 'LOW':
+                    return 'LOW'
+        
+        # Default: return as-is for LOW, or if we don't have enough history
+        return alert_level
     
     def analyze_general_scene(self, frames: List[bytes]) -> Dict[str, any]:
         """
@@ -377,11 +444,12 @@ class DriverBehaviorAnalyzer:
                                                           'SEVERE DROWSINESS', 'DANGEROUS', 'CRITICAL']):
             return 'HIGH'
         
-        # Check for moderate concern keywords
+        # Check for moderate concern keywords - be more conservative
         moderate_keywords = [
-            'MILD DROWSINESS', 'SOMEWHAT TIRED', 'SLIGHTLY DISTRACTED',
-            'TIRED', 'FATIGUE', 'EXHAUSTION', 'DISTRACTED', 'ANGRY'
+            'EYES FREQUENTLY CLOSING', 'HEAD NODDING', 'CLEAR DROWSINESS',
+            'EYES STRUGGLING', 'FREQUENT BLINKING', 'HEAVY EYELIDS'
         ]
+        # Don't trigger on just "TIRED" or "FATIGUE" alone - need more specific signs
         if any(keyword in response_upper for keyword in moderate_keywords):
             return 'MODERATE'
         
@@ -396,7 +464,7 @@ class DriverBehaviorAnalyzer:
     def _adjust_alert_level_by_face_state(self, current_level: str, face_state: str, response: Optional[str]) -> str:
         """
         Adjust alert level based on detected face state.
-        Sub-optimal states (tired, exhausted, sleepy, angry) should trigger alerts.
+        SLEEPY face state always results in HIGH alert level for safety.
         
         Args:
             current_level: Current alert level from LLM response
@@ -406,36 +474,20 @@ class DriverBehaviorAnalyzer:
         Returns:
             Adjusted alert level
         """
-        # Define concerning face states that should trigger alerts
-        concerning_states = {
-            'SLEEPY': 'HIGH',      # Sleepy is high concern
-            'EXHAUSTED': 'HIGH',   # Exhausted is high concern
-            'TIRED': 'MODERATE',   # Tired is moderate concern
-            'ANGRY': 'MODERATE',   # Angry is moderate concern (emotional state affecting driving)
-        }
+        # SLEEPY face state always results in HIGH alert level
+        if face_state == 'SLEEPY':
+            return 'HIGH'
         
-        # Normal states that should not raise alerts unless LLM detects issues
-        normal_states = ['AWAKE', 'NEUTRAL', 'JOYFUL']
-        
-        # If face state is concerning, adjust alert level
-        if face_state in concerning_states:
-            required_level = concerning_states[face_state]
-            
-            # If current level is lower than required, upgrade it
-            level_priority = {'LOW': 1, 'MODERATE': 2, 'HIGH': 3}
-            if level_priority.get(current_level, 0) < level_priority.get(required_level, 0):
-                logger.info(
-                    f"Upgrading alert level from {current_level} to {required_level} "
-                    f"based on face state: {face_state}"
-                )
-                return required_level
-        
-        # If face state is normal but LLM detected issues, trust the LLM
-        elif face_state in normal_states:
-            # Keep the LLM's assessment, but don't downgrade if it's already MODERATE/HIGH
+        # Only upgrade if LLM already detected some concern AND face state confirms it
+        # Don't upgrade from LOW to MODERATE/HIGH based solely on face state (except SLEEPY)
+        if current_level == 'LOW':
+            # Even if face state is concerning, trust LLM's LOW assessment
+            # (LLM sees the full context, face state might be misleading)
+            # Exception: SLEEPY is always HIGH (handled above)
             return current_level
         
-        # For unknown states, trust the LLM but be cautious
+        # If LLM detected MODERATE/HIGH, and face state confirms, keep it
+        # If face state is normal but LLM detected issues, trust the LLM
         return current_level
     
     def _is_safety_concern(self, response: Optional[str]) -> bool:
@@ -473,6 +525,28 @@ class DriverBehaviorAnalyzer:
         # and not overridden by normal state indicators
         return has_safety_keyword and not (has_normal_keyword and 'NOT' not in response_upper)
     
+    def _format_video_timestamp(self, seconds: float) -> str:
+        """
+        Format video timestamp in seconds to readable format (HH:MM:SS or MM:SS).
+        
+        Args:
+            seconds: Timestamp in seconds
+        
+        Returns:
+            Formatted timestamp string
+        """
+        if seconds < 0:
+            return "00:00"
+        
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+    
     def _trigger_alert(self, analysis_result: Dict[str, any]) -> None:
         """
         Trigger safety alert for concerning behavior.
@@ -491,30 +565,38 @@ class DriverBehaviorAnalyzer:
         if 'frame_id' in analysis_result:
             alert['frame_id'] = analysis_result['frame_id']
         
+        # Include video timestamp if available
+        if 'timestamp_seconds' in analysis_result:
+            alert['timestamp_seconds'] = analysis_result['timestamp_seconds']
+            video_time_str = f" [Video Time: {self._format_video_timestamp(analysis_result['timestamp_seconds'])}]"
+        else:
+            video_time_str = ""
+        
         self.alert_history.append(alert)
         
         # Log alert
         logger.warning(
             f"SAFETY ALERT - Level: {alert['level']}, "
             f"Type: {alert['type']}, "
-            f"Time: {alert['timestamp']}"
+            f"Time: {alert['timestamp']}{video_time_str}"
         )
         
         # Print alert (in real system, this would trigger audio/visual warnings)
         print("\n" + "="*60)
         print(f"⚠️  SAFETY ALERT - {alert['level']} CONCERN DETECTED")
         print(f"Type: {alert['type']}")
-        print(f"Time: {alert['timestamp']}")
+        print(f"Time: {alert['timestamp']}{video_time_str}")
         print(f"Details: {alert['details'][:200]}...")
         print("="*60 + "\n")
     
-    def process_frame_sequence(self, frames: List[bytes], frame_id: Optional[int] = None) -> Dict[str, any]:
+    def process_frame_sequence(self, frames: List[bytes], frame_id: Optional[int] = None, timestamp_seconds: Optional[float] = None) -> Dict[str, any]:
         """
         Process a sequence of frames for comprehensive driver analysis.
         
         Args:
             frames: List of frame bytes (temporal sequence)
             frame_id: Optional frame sequence ID for tracking
+            timestamp_seconds: Optional video timestamp in seconds
         
         Returns:
             Dictionary with all analysis results
@@ -546,11 +628,12 @@ class DriverBehaviorAnalyzer:
         
         logger.info("Detecting impaired driving patterns...")
         # Pass face state to impaired driving detection so it can use this information
-        # Also pass frame_id if available
+        # Also pass frame_id and timestamp_seconds if available
         impaired_result = self.detect_impaired_driving(
             frames, 
             face_state=detected_face_state,
-            frame_id=frame_id
+            frame_id=frame_id,
+            timestamp_seconds=timestamp_seconds
         )
         results['analyses']['impaired_driving'] = impaired_result
         
@@ -572,11 +655,16 @@ class InCarVideoProcessor:
         self.frame_buffer = deque(maxlen=config.FRAME_BUFFER_SIZE)
         self.frame_count = 0
         self.frame_sequence_id = 0  # Running index for analyzed frame sequences
-        self.frame_summaries = []  # Store summaries for each analyzed frame sequence
+        self.frame_summaries = []  # Store summaries for each analyzed frame sequences
+        self.detections_for_evaluation = []  # Store detections for ground truth evaluation
+        self.video_fps = None  # Will be set when video is opened
+        self.recent_alert_levels = deque(maxlen=3)  # Track recent alert levels for temporal smoothing
+        self.has_ground_truth = False  # Will be set if ground truth is available
     
     def encode_frame(self, frame) -> bytes:
         """
         Encode OpenCV frame to JPEG bytes.
+        Optionally resizes frame based on configuration for performance.
         
         Args:
             frame: OpenCV frame (numpy array)
@@ -584,6 +672,20 @@ class InCarVideoProcessor:
         Returns:
             JPEG encoded frame as bytes
         """
+        # Resize frame if configured
+        if self.config.FRAME_RESIZE_TO is not None:
+            target_width, target_height = self.config.FRAME_RESIZE_TO
+            current_height, current_width = frame.shape[:2]
+            
+            # Only resize if dimensions differ
+            if current_width != target_width or current_height != target_height:
+                frame = cv2.resize(
+                    frame, 
+                    (target_width, target_height), 
+                    interpolation=cv2.INTER_AREA
+                )
+                logger.debug(f"Resized frame from {current_width}x{current_height} to {target_width}x{target_height}")
+        
         success, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not success:
             raise ValueError("Failed to encode frame")
@@ -610,7 +712,10 @@ class InCarVideoProcessor:
             frame_number += 1
             
             if debug_show:
-                cv2.imshow('Driver Monitoring', frame)
+                # Resize frame to 50% for display
+                height, width = frame.shape[:2]
+                display_frame = cv2.resize(frame, (width // 2, height // 2))
+                cv2.imshow('Driver Monitoring', display_frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     logger.info("User requested stop")
                     break
@@ -630,10 +735,32 @@ class InCarVideoProcessor:
             debug_show: Whether to show debug window
         """
         logger.info("Starting driver monitoring system...")
-        logger.info(f"Processing interval: {self.config.PROCESSING_INTERVAL_SECONDS} seconds")
+        
+        # Get video FPS for timestamp calculation
+        self.video_fps = cap.get(cv2.CAP_PROP_FPS)
+        if self.video_fps <= 0:
+            self.video_fps = self.config.FRAME_RATE
+        
+        # Log frame resize configuration
+        if self.config.FRAME_RESIZE_TO is None:
+            logger.info("Frame resizing: DISABLED (using original resolution)")
+        else:
+            width, height = self.config.FRAME_RESIZE_TO
+            logger.info(f"Frame resizing: ENABLED - resized to {width}x{height}")
+        
+        # Use shorter processing interval if ground truth is available (to catch short periods)
+        processing_interval = self.config.PROCESSING_INTERVAL_SECONDS
+        if self.has_ground_truth:
+            # Use 0.1 second intervals for ground truth videos to catch short periods
+            processing_interval = 0.1 * 20
+            logger.info(f"Ground truth detected - using shorter processing interval: {processing_interval}s")
+        
+        logger.info(f"Processing interval: {processing_interval} seconds")
         logger.info(f"Frame buffer size: {self.config.FRAME_BUFFER_SIZE} frames")
         
-        frames_per_interval = self.config.PROCESSING_INTERVAL_SECONDS * self.config.FRAME_RATE
+        frames_per_interval = int(processing_interval * self.video_fps)
+        if frames_per_interval < 1:
+            frames_per_interval = 1
         
         for frame_number, frame in self.frame_generator(cap, debug_show):
             # Add frame to buffer
@@ -645,16 +772,40 @@ class InCarVideoProcessor:
                 # Increment frame sequence ID
                 self.frame_sequence_id += 1
                 
-                logger.info(f"Processing frame sequence #{self.frame_sequence_id} at video frame {frame_number}...")
+                # Calculate timestamp for this frame (before processing so it can be used in alerts)
+                timestamp = frame_number / self.video_fps if self.video_fps > 0 else 0
+                timestamp_str = self._format_video_timestamp(timestamp)
+                
+                logger.info(f"Processing frame sequence #{self.frame_sequence_id} at video frame {frame_number} [Video Time: {timestamp_str}]...")
                 
                 # Convert buffer to list for analysis
                 frame_sequence = list(self.frame_buffer)
                 
-                # Perform comprehensive analysis (pass frame_id so alerts can include it)
-                results = self.analyzer.process_frame_sequence(frame_sequence, frame_id=self.frame_sequence_id)
+                # Perform comprehensive analysis (pass frame_id and timestamp_seconds so alerts can include them)
+                results = self.analyzer.process_frame_sequence(
+                    frame_sequence, 
+                    frame_id=self.frame_sequence_id,
+                    timestamp_seconds=timestamp
+                )
                 
                 # Add video frame number to results
                 results['video_frame_number'] = frame_number
+                
+                # Add timestamp to results (already passed to process_frame_sequence, but ensure it's in results)
+                results['timestamp_seconds'] = timestamp
+                
+                # Store detection for ground truth evaluation
+                # Extract alert level from impaired_driving analysis
+                detection_record = {
+                    'video_frame_number': frame_number,
+                    'timestamp': timestamp,
+                    'alert_level': 'LOW'  # Default
+                }
+                if 'analyses' in results and 'impaired_driving' in results['analyses']:
+                    impaired_analysis = results['analyses']['impaired_driving']
+                    detection_record['alert_level'] = impaired_analysis.get('alert_level', 'LOW')
+                    detection_record['analyses'] = {'impaired_driving': impaired_analysis}
+                self.detections_for_evaluation.append(detection_record)
                 
                 # Store summary for later
                 summary = self._create_frame_summary(results)
@@ -673,6 +824,28 @@ class InCarVideoProcessor:
         
         logger.info("Video processing stopped")
     
+    def _format_video_timestamp(self, seconds: float) -> str:
+        """
+        Format video timestamp in seconds to readable format (HH:MM:SS or MM:SS).
+        
+        Args:
+            seconds: Timestamp in seconds
+        
+        Returns:
+            Formatted timestamp string
+        """
+        if seconds < 0:
+            return "00:00"
+        
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+    
     def _print_analysis_results(self, results: Dict[str, any]) -> None:
         """
         Print formatted analysis results.
@@ -685,9 +858,15 @@ class InCarVideoProcessor:
         
         frame_id = results.get('frame_id', 'N/A')
         video_frame = results.get('video_frame_number', 'N/A')
+        timestamp_seconds = results.get('timestamp_seconds', None)
+        
+        # Format video timestamp if available
+        video_time_str = ""
+        if timestamp_seconds is not None:
+            video_time_str = f" [Video Time: {self._format_video_timestamp(timestamp_seconds)}]"
         
         print("\n" + "-"*60)
-        print(f"Frame #{frame_id} (Video Frame {video_frame}) - {results['timestamp']}")
+        print(f"Frame #{frame_id} (Video Frame {video_frame}){video_time_str} - {results['timestamp']}")
         print("-"*60)
         
         for analysis_type, analysis_data in results['analyses'].items():
@@ -744,28 +923,82 @@ class InCarVideoProcessor:
         return " | ".join(summary_parts) if summary_parts else "Analysis completed"
 
 
-def main():
+def find_video_files(data_dir: str = "data") -> List[str]:
     """
-    Main function to run in-car driver monitoring system.
-    """
-    # Initialize configuration
-    config = DriverMonitoringConfig()
+    Find all video files in the data directory (recursively).
     
-    # Initialize video processor
+    Args:
+        data_dir: Path to data directory (default: "data")
+    
+    Returns:
+        List of video file paths
+    """
+    video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm'}
+    video_files = []
+    
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        logger.warning(f"Data directory not found: {data_dir}")
+        return video_files
+    
+    # Recursively search for video files
+    for video_file in data_path.rglob('*'):
+        if video_file.is_file() and video_file.suffix.lower() in video_extensions:
+            video_files.append(str(video_file))
+    
+    # Sort for consistent processing order
+    video_files.sort()
+    
+    return video_files
+
+
+def process_single_video(video_path: str, config: DriverMonitoringConfig, debug_show: bool = False) -> Dict[str, any]:
+    """
+    Process a single video file.
+    
+    Args:
+        video_path: Path to video file
+        config: Driver monitoring configuration
+        debug_show: Whether to show debug window
+    
+    Returns:
+        Dictionary with processing results
+    """
+    logger.info(f"Processing video: {video_path}")
+    
+    # Initialize ground truth evaluator
+    evaluator = GroundTruthEvaluator()
+    
+    # Check if ground truth exists for this video
+    video_filename = Path(video_path).name
+    has_ground_truth = evaluator.get_ground_truth_for_video(video_filename) is not None
+    
+    # Initialize video processor for this video
     processor = InCarVideoProcessor(config)
+    processor.has_ground_truth = has_ground_truth
     
-    # Open video source (0 for webcam, or path to video file)
-    video_source = 0  # Change to video file path if using recorded video
-    cap = cv2.VideoCapture(video_source)
+    if has_ground_truth:
+        logger.info(f"Ground truth available for {video_filename} - using optimized processing")
+    
+    # Open video file
+    cap = cv2.VideoCapture(video_path)
     
     if not cap.isOpened():
-        logger.error(f"Cannot open video source: {video_source}")
-        raise IOError(f"Cannot open video source: {video_source}")
+        logger.error(f"Cannot open video file: {video_path}")
+        return {
+            'video_path': video_path,
+            'success': False,
+            'error': f"Cannot open video file: {video_path}"
+        }
     
     # Get video properties
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+    
+    logger.info(f"Video properties - FPS: {fps}, Total frames: {total_frames}, Duration: {duration:.2f}s")
+    
     if fps > 0:
-        logger.info(f"Video FPS: {fps}")
         # Update config if video has different frame rate
         if abs(fps - config.FRAME_RATE) > 5:
             logger.warning(
@@ -775,7 +1008,91 @@ def main():
     
     try:
         # Process video stream
-        processor.process_video_stream(cap, debug_show=True)
+        processor.process_video_stream(cap, debug_show=debug_show)
+        
+        # Calculate accuracy if ground truth is available
+        accuracy_metrics = None
+        if processor.detections_for_evaluation:
+            accuracy_metrics = evaluator.calculate_frame_level_accuracy(
+                video_filename,
+                processor.detections_for_evaluation,
+                fps
+            )
+            if accuracy_metrics.get('has_ground_truth', False):
+                evaluator.print_accuracy_report(accuracy_metrics)
+                # Save evaluation results to file
+                evaluator.save_evaluation_results(accuracy_metrics, video_path)
+        
+        return {
+            'video_path': video_path,
+            'success': True,
+            'fps': fps,
+            'total_frames': total_frames,
+            'duration': duration,
+            'frame_summaries': processor.frame_summaries,
+            'alerts': processor.analyzer.alert_history,
+            'total_analyses': len(processor.frame_summaries),
+            'total_alerts': len(processor.analyzer.alert_history),
+            'accuracy_metrics': accuracy_metrics
+        }
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        return {
+            'video_path': video_path,
+            'success': False,
+            'error': 'Interrupted by user'
+        }
+    except Exception as e:
+        logger.error(f"Error processing video {video_path}: {e}", exc_info=True)
+        return {
+            'video_path': video_path,
+            'success': False,
+            'error': str(e)
+        }
+    finally:
+        # Cleanup
+        cap.release()
+        if debug_show:
+            cv2.destroyAllWindows()
+
+
+def process_camera_feed(config: DriverMonitoringConfig, camera_index: int = 0, debug_show: bool = True) -> None:
+    """
+    Process live camera feed for driver monitoring.
+    
+    Args:
+        config: Driver monitoring configuration
+        camera_index: Camera device index (default: 0)
+        debug_show: Whether to show debug window
+    """
+    logger.info("Starting driver monitoring system with camera feed...")
+    
+    # Initialize video processor
+    processor = InCarVideoProcessor(config)
+    
+    # Open camera feed
+    cap = cv2.VideoCapture(camera_index)
+    
+    if not cap.isOpened():
+        logger.error(f"Cannot open camera device: {camera_index}")
+        raise IOError(f"Cannot open camera device: {camera_index}")
+    
+    # Get camera properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps > 0:
+        logger.info(f"Camera FPS: {fps}")
+        # Update config if camera has different frame rate
+        if abs(fps - config.FRAME_RATE) > 5:
+            logger.warning(
+                f"Camera FPS ({fps}) differs significantly from config ({config.FRAME_RATE}). "
+                "Consider updating config."
+            )
+    else:
+        logger.info(f"Using configured FPS: {config.FRAME_RATE}")
+    
+    try:
+        # Process video stream
+        processor.process_video_stream(cap, debug_show=debug_show)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     except Exception as e:
@@ -808,6 +1125,143 @@ def main():
                 frame_id_str = f"Frame #{alert.get('frame_id', 'N/A')} - " if 'frame_id' in alert else ""
                 print(f"[{alert['timestamp']}] {frame_id_str}{alert['level']} - {alert['type']}")
             print("="*60)
+
+
+def main():
+    """
+    Main function to run in-car driver monitoring system.
+    Supports both video file processing and live camera feed.
+    """
+    parser = argparse.ArgumentParser(
+        description='Driver monitoring system - process videos or live camera feed'
+    )
+    parser.add_argument(
+        '--camera',
+        action='store_true',
+        help='Use live camera feed instead of video files (default: process videos from data folder)'
+    )
+    parser.add_argument(
+        '--camera-index',
+        type=int,
+        default=0,
+        help='Camera device index (default: 0, only used with --camera)'
+    )
+    parser.add_argument(
+        '--data-dir',
+        type=str,
+        default='data',
+        help='Path to data directory containing videos (default: data, only used without --camera)'
+    )
+    parser.add_argument(
+        '--video',
+        type=str,
+        default=None,
+        help='Process a specific video file (if not specified, processes all videos in data directory, only used without --camera)'
+    )
+    parser.add_argument(
+        '--no-display',
+        action='store_true',
+        help='Disable video display window (faster processing)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Initialize configuration
+    config = DriverMonitoringConfig()
+    debug_show = not args.no_display
+    
+    # Process camera feed if requested
+    if args.camera:
+        process_camera_feed(config, camera_index=args.camera_index, debug_show=debug_show)
+        return
+    
+    # Otherwise, process video files
+    # Determine which videos to process
+    if args.video:
+        # Process single specified video
+        video_path = Path(args.video)
+        if not video_path.exists():
+            logger.error(f"Video file not found: {args.video}")
+            return
+        video_files = [str(video_path)]
+    else:
+        # Find all videos in data directory
+        video_files = find_video_files(args.data_dir)
+        if not video_files:
+            logger.error(f"No video files found in {args.data_dir}")
+            return
+    
+    logger.info(f"Found {len(video_files)} video file(s) to process")
+    
+    # Process each video
+    all_results = []
+    
+    for i, video_path in enumerate(video_files, 1):
+        print("\n" + "="*80)
+        print(f"Processing video {i}/{len(video_files)}: {os.path.basename(video_path)}")
+        print("="*80)
+        
+        result = process_single_video(video_path, config, debug_show=debug_show)
+        all_results.append(result)
+        
+        # Print per-video summary
+        if result['success']:
+            print(f"\n✓ Completed: {os.path.basename(video_path)}")
+            print(f"  - Total analyses: {result['total_analyses']}")
+            print(f"  - Total alerts: {result['total_alerts']}")
+            
+            if result['frame_summaries']:
+                print("\n  Frame Analysis Summary:")
+                for frame_summary in result['frame_summaries']:
+                    print(f"    Frame ID: {frame_summary['frame_id']} - {frame_summary['summary']}")
+            
+            if result['alerts']:
+                print("\n  Alerts:")
+                for alert in result['alerts']:
+                    frame_id_str = f"Frame #{alert.get('frame_id', 'N/A')} - " if 'frame_id' in alert else ""
+                    print(f"    [{alert['level']}] {frame_id_str}{alert['type']}")
+        else:
+            print(f"\n✗ Failed: {os.path.basename(video_path)} - {result.get('error', 'Unknown error')}")
+    
+    # Print overall summary
+    print("\n" + "="*80)
+    print("OVERALL PROCESSING SUMMARY")
+    print("="*80)
+    
+    successful = [r for r in all_results if r['success']]
+    failed = [r for r in all_results if not r['success']]
+    
+    print(f"Total videos processed: {len(all_results)}")
+    print(f"  - Successful: {len(successful)}")
+    print(f"  - Failed: {len(failed)}")
+    
+    if successful:
+        total_analyses = sum(r['total_analyses'] for r in successful)
+        total_alerts = sum(r['total_alerts'] for r in successful)
+        print(f"\nTotal analyses across all videos: {total_analyses}")
+        print(f"Total alerts across all videos: {total_alerts}")
+        
+        # List all alerts from all videos
+        if total_alerts > 0:
+            print("\n" + "-"*80)
+            print("ALL ALERTS ACROSS ALL VIDEOS")
+            print("-"*80)
+            for result in successful:
+                if result['alerts']:
+                    print(f"\nVideo: {os.path.basename(result['video_path'])}")
+                    for alert in result['alerts']:
+                        frame_id_str = f"Frame #{alert.get('frame_id', 'N/A')} - " if 'frame_id' in alert else ""
+                        print(f"  [{alert['timestamp']}] {frame_id_str}{alert['level']} - {alert['type']}")
+    
+    if failed:
+        print("\n" + "-"*80)
+        print("FAILED VIDEOS")
+        print("-"*80)
+        for result in failed:
+            print(f"  {os.path.basename(result['video_path'])}: {result.get('error', 'Unknown error')}")
+    
+    print("="*80)
+    logger.info("All videos processed")
 
 
 if __name__ == "__main__":

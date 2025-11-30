@@ -19,7 +19,6 @@ A project combining **educational presentation goals** with **practical implemen
 - **[Research & Planning](docs/04-research.md)** - Research findings, model comparisons, and recommendations
 
 ### Examples
-- **[Reference Implementation](examples/reference-implementation.py)** - Code example from the ollama-home-surveillance project
 
 ### Presentation
 - **[Slide Deck](presentations/slides.md)** - Complete presentation materials
@@ -56,8 +55,6 @@ Text Output
    ollama search video
    ```
 
-3. **Review code examples**:
-   - See [Reference Implementation](examples/reference-implementation.py) for a working example
 
 ## 📋 Key Features
 

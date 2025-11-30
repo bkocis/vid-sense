@@ -215,7 +215,7 @@ vid-sense/
 │   ├── demo_video.mp4       # Test video
 │   └── demo_queries.txt     # Example queries
 ├── examples/
-│   └── reference-implementation.py  # Reference code
+│   └── 
 ├── presentations/
 │   └── slides.md            # Presentation materials
 └── requirements.txt

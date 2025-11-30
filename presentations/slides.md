@@ -822,7 +822,4 @@ Key features:
 - Scene change detection
 - Multiple query types
 
-**See**: `examples/reference-implementation.py`
-
-This provides a working baseline for video understanding with local LLMs.
 
